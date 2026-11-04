@@ -12,9 +12,10 @@
     3. dangling = 0             —— 无悬空图片引用（Word 里会显示红叉）
     4. low-res = 0              —— 无残留低清装饰图
     5. 文件名形如 yyyy.mm.dd(Title).docx
-    6. 首段形如 yyyy.mm.dd（…）  —— 日期行 + 标注
+    6. 首段严格为 yyyy.mm.dd（发出日期）
     7. 次段非空                  —— 标题行存在
-    8. 体积 < 8MB（默认软阈值）  —— 提示残留部件
+    8. 第 3 段起无居中段落        —— 小标题必须居左
+    9. 体积 < 8MB（默认软阈值）  —— 提示残留部件
 """
 
 import argparse
@@ -24,7 +25,8 @@ import re
 import sys
 
 BLIP = ".//{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
-DATE_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}")
+# 日期行固定：yyyy.mm.dd（发出日期），一个字都不能少
+DATE_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}（发出日期）$")
 # 文件名固定规则：yyyy.mm.dd(Title).docx
 NAME_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}\(.+\)\.docx$")
 SIZE_LIMIT_KB = 8 * 1024
@@ -91,7 +93,12 @@ def check_one(path, min_px, min_area):
     if lowres:
         problems.append("low-res=%d" % lowres)
     if not DATE_RE.match(head):
-        problems.append("首段异常:%r" % head[:20])
+        problems.append("日期行不符(yyyy.mm.dd（发出日期）):%r" % head[:24])
+
+    # 小标题一律居左：第 3 段起不允许出现居中段落
+    centered = [p.text[:12] for p in paras[2:] if str(p.alignment).startswith("CENTER")]
+    if centered:
+        problems.append("存在居中段落:%s" % centered[:2])
     if not title:
         problems.append("缺标题行")
     if size_kb > SIZE_LIMIT_KB:

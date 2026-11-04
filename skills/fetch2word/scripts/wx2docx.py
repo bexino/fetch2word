@@ -41,6 +41,9 @@ REFERER = "https://mp.weixin.qq.com/"
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_TEMPLATE = os.path.join(SKILL_DIR, "assets", "template.docx")
 
+# 日期行固定为：yyyy.mm.dd（发出日期）—— 与模板完全一致，不提供开关
+DATE_NOTE = "（发出日期）"
+
 # 文件名规则固定为：文件名：yyyy.mm.dd(Title).docx
 # Title = 标题去掉栏目前缀，剔除 Windows 非法字符，过长截断
 NAME_MAX = 60
@@ -351,7 +354,7 @@ def clear_body(doc):
 
 
 def build_doc(template_path, spec, art, img_paths, out_path,
-              date_note, keep_gif, min_px=MIN_PX, min_area=MIN_AREA):
+              keep_gif, min_px=MIN_PX, min_area=MIN_AREA):
     from docx import Document
     from docx.shared import Emu, Pt
     from docx.image.image import Image as DocxImage
@@ -372,7 +375,7 @@ def build_doc(template_path, spec, art, img_paths, out_path,
         return p
 
     y, m, d = art["date"].split("-")
-    styled("%s.%s.%s%s" % (y, m, d, date_note))
+    styled("%s.%s.%s%s" % (y, m, d, DATE_NOTE))
     styled(art["title"])
 
     n_img = 0
@@ -388,8 +391,8 @@ def build_doc(template_path, spec, art, img_paths, out_path,
             r.bold = True
             r.font.size = Pt(spec["h1_size"] if kind == "h1" else spec["h2_size"])
             r._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:hint"), "eastAsia")
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             if kind == "h1":
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 p.paragraph_format.space_before = Pt(6)
                 p.paragraph_format.space_after = Pt(6)
             n_head += 1
@@ -452,7 +455,6 @@ def main():
                     help="可选：覆盖内置模板（默认用 skill 自带的脱敏模板）")
     ap.add_argument("--out", required=True, help="输出目录")
     ap.add_argument("--column", default="学院动态", help="标题无栏目前缀时补的前缀，留空则不补")
-    ap.add_argument("--date-note", default="（发出日期）", help="日期后紧跟的标注，留空则不加")
     ap.add_argument("--sort", choices=["auto", "asc", "desc", "none"], default="auto",
                     help="按发布日期排序；auto 表示识别清单里的“排序：”提示")
     ap.add_argument("--keep-gif", action="store_true", help="保留 gif 图片（默认删除装饰性 gif）")
@@ -560,11 +562,20 @@ def main():
     spec = read_template_spec(template)
     rows = []
     lost = []  # 真正丢内容的图片（下载失败/格式不支持）
+    locked = []
     for a in arts:
         name = safe_name(a["date"], a["title"])
         dst = os.path.join(args.out, name)
+        if os.path.exists(dst):
+            try:
+                fh = open(dst, "r+b")
+                fh.close()
+            except Exception:
+                locked.append(name)
+                print("SKIP 被占用（请先在 Word/WPS 中关闭）：%s" % name)
+                continue
         n_img, skips, n_head = build_doc(template, spec, a, img_paths, dst,
-                                         args.date_note, args.keep_gif,
+                                         args.keep_gif,
                                          args.min_px, args.min_area)
         tally = {}
         for reason, url, dims in skips:
