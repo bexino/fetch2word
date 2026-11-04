@@ -30,7 +30,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from filters import (MIN_AREA, MIN_PX, is_decorative,  # noqa: E402
+from filters import (ALPHA_FRAC, MIN_AREA, MIN_PX, is_decorative,  # noqa: E402
                      is_end_marker, qr_like_image, translucent_image)
 
 BLIP = ".//{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
@@ -41,7 +41,7 @@ NAME_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}\(.+\)\.docx$")
 SIZE_LIMIT_KB = 8 * 1024
 
 
-def check_one(path, min_px, min_area, name_max=16):
+def check_one(path, min_px, min_area, name_max=16, alpha_frac=ALPHA_FRAC):
     from docx import Document
     from docx.image.image import Image as DocxImage
     from docx.oxml.ns import qn
@@ -54,7 +54,8 @@ def check_one(path, min_px, min_area, name_max=16):
     gif = 0
     lowres = 0
     qr = 0
-    lead_decor = 0   # 正文开始前的透明贴图 / 超宽横幅
+    translucent = 0   # 透明底贴图（全文，不看位置）
+    lead_banner = 0   # 正文前的不透明超宽横幅
     imgs = 0
     seen_text = False
     for pi, para in enumerate(doc.paragraphs):
@@ -78,23 +79,29 @@ def check_one(path, min_px, min_area, name_max=16):
                     lowres += 1
             except Exception:
                 pass
-            # 一张图只记一次：二维码 > 开头贴图
-            is_qr = lead = False
+            # 一张图只记一次：二维码 > 透明贴图 > 开头横幅
+            is_qr = is_alpha = is_banner = False
             try:
                 from PIL import Image as PILImage
                 with PILImage.open(io.BytesIO(part.blob)) as im:
                     is_qr = qr_like_image(im.copy())
-                    if not is_qr and not seen_text:
-                        lead = translucent_image(im)
+                    if not is_qr:
+                        is_alpha = translucent_image(im, alpha_frac)
             except Exception:
                 pass
-            if not is_qr and not lead and not seen_text \
+            if not is_qr and not is_alpha and not seen_text \
                     and info is not None and info.px_height:
-                lead = info.px_width / float(info.px_height) >= 2.2
+                is_banner = info.px_width / float(info.px_height) >= 2.2
             if is_qr:
                 qr += 1
-            elif lead:
-                lead_decor += 1
+            elif is_alpha:
+                translucent += 1
+            elif is_banner:
+                lead_banner += 1
+
+    # 整篇图片都是透明底（设计稿式推送）不算问题，与生成端保持一致
+    if imgs and translucent >= imgs:
+        translucent = 0
 
     empty = 0
     for para in doc.paragraphs:
@@ -128,8 +135,10 @@ def check_one(path, min_px, min_area, name_max=16):
         problems.append("low-res=%d" % lowres)
     if qr:
         problems.append("qr=%d" % qr)
-    if lead_decor:
-        problems.append("开头装饰素材=%d" % lead_decor)
+    if translucent:
+        problems.append("透明素材=%d" % translucent)
+    if lead_banner:
+        problems.append("开头横幅=%d" % lead_banner)
     # 文末不允许留 END 标记（含 -END-、（完）、THE END 等变体）
     tail = ""
     for p in reversed(paras):
@@ -179,6 +188,8 @@ def main():
     ap.add_argument("--min-area", type=int, default=40000, help="装饰图像素面积阈值")
     ap.add_argument("--name-max", type=int, default=16,
                     help="文件名里标题的字数上限，超了说明没走简化，默认 16；传 0 关闭该项")
+    ap.add_argument("--alpha-frac", type=float, default=ALPHA_FRAC,
+                    help="透明像素占比超过该值即视为装饰贴图，默认 %.2f" % ALPHA_FRAC)
     args = ap.parse_args()
 
     try:
@@ -194,7 +205,7 @@ def main():
     bad = 0
     total_img = 0
     for f in files:
-        r = check_one(f, args.min_px, args.min_area, args.name_max)
+        r = check_one(f, args.min_px, args.min_area, args.name_max, args.alpha_frac)
         total_img += r["imgs"]
         flag = "OK  " if not r["problems"] else "FAIL"
         if r["problems"]:

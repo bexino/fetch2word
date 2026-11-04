@@ -36,7 +36,7 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from title_naming import (NAME_MAX, NAME_TITLE_MAX, load_name_map,  # noqa: E402
                           lookup_name, safe_name, short_title)
-from filters import (MIN_AREA, MIN_PX, has_transparency,  # noqa: E402
+from filters import (ALPHA_FRAC, MIN_AREA, MIN_PX, has_transparency,  # noqa: E402
                      is_decorative, is_end_marker, is_gif, is_qr_code,
                      is_wide_banner, strip_tail_end)
 
@@ -100,7 +100,11 @@ def download_image(url, dst):
 
 
 def ensure_supported(path):
-    """python-docx 解析不了的格式（如 webp）转成 jpg，返回可用路径或 None。"""
+    """python-docx 解析不了的格式（如 webp）转成可用格式，返回可用路径或 None。
+
+    有透明通道的一律转 PNG：转 JPEG 会把 alpha 压成白底，
+    装饰贴纸就此洗白成「普通图片」，后面的透明检测再也认不出来。
+    """
     from docx.image.image import Image as DocxImage
     try:
         DocxImage.from_file(path)
@@ -113,6 +117,11 @@ def ensure_supported(path):
         return None
     try:
         im = PILImage.open(path)
+        if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info:
+            im = im.convert("RGBA")
+            new_path = os.path.splitext(path)[0] + ".conv.png"
+            im.save(new_path, "PNG", optimize=True)
+            return new_path
         if im.mode not in ("RGB", "L"):
             im = im.convert("RGB")
         new_path = os.path.splitext(path)[0] + ".conv.jpg"
@@ -389,7 +398,7 @@ def apply_first_line_indent(para, body_size):
 
 
 def build_doc(template_path, spec, art, img_paths, out_path,
-              keep_gif, min_px=MIN_PX, min_area=MIN_AREA):
+              keep_gif, min_px=MIN_PX, min_area=MIN_AREA, alpha_frac=ALPHA_FRAC):
     from docx import Document
     from docx.shared import Emu, Pt
     from docx.image.image import Image as DocxImage
@@ -405,20 +414,30 @@ def build_doc(template_path, spec, art, img_paths, out_path,
     n_end = (sum(1 for k, v in orig_blocks if k != "img" and is_end_marker(v))
              - sum(1 for k, v in blocks if k != "img" and is_end_marker(v)))
 
-    # 开头装饰素材：正文第一段文字之前的贴图（透明底横幅、礼花、华表、分割条）
-    # 只删「透明底 或 超宽横条」，实拍照片照常保留
+    # 透明底装饰素材：**全文**检测，不只看开头——正文中间的贴纸（艺术字、枫叶、
+    # 分割条）才是真实生产里最容易漏的那批
+    img_idx = [i for i, (k, _) in enumerate(blocks) if k == "img"]
+    alpha_skip = set()
+    for i in img_idx:
+        p = img_paths.get(blocks[i][1], "")
+        if p and os.path.exists(p) and has_transparency(p, alpha_frac):
+            alpha_skip.add(i)
+    # 整篇图片都是透明底（设计稿式长图推送）时不能全删，否则产出是空壳
+    if img_idx and len(alpha_skip) >= len(img_idx):
+        alpha_skip.clear()
+
+    # 开头横幅：正文第一段文字之前的超宽横条（不透明的头条条幅）
     first_text = next((i for i, (k, v) in enumerate(blocks)
                        if k != "img" and v.strip()), None)
-    lead_decor = set()
+    lead_banner = set()
     if first_text:
         for i, (k, v) in enumerate(blocks[:first_text]):
             p = img_paths.get(v, "")
             if k == "img" and p and os.path.exists(p) \
-                    and (has_transparency(p) or is_wide_banner(p)):
-                lead_decor.add(i)
-        # 整篇都是开头贴图（纯图推送）时不能全删，否则产出是空壳
-        if len(lead_decor) >= sum(1 for k, _ in blocks if k == "img"):
-            lead_decor.clear()
+                    and i not in alpha_skip and is_wide_banner(p):
+                lead_banner.add(i)
+        if img_idx and len(alpha_skip) + len(lead_banner) >= len(img_idx):
+            lead_banner.clear()
 
     def styled(text):
         p = doc.add_paragraph()
@@ -474,9 +493,13 @@ def build_doc(template_path, spec, art, img_paths, out_path,
         if is_qr_code(path):
             skips.append(("二维码", val, ""))
             continue
-        # 开头贴图素材：正文之前、透明底或超宽横条
-        if idx in lead_decor:
-            skips.append(("开头装饰素材", val, ""))
+        # 透明底贴图：全文拦，不区分位置
+        if idx in alpha_skip:
+            skips.append(("透明素材", val, ""))
+            continue
+        # 开头超宽横幅
+        if idx in lead_banner:
+            skips.append(("开头横幅", val, ""))
             continue
 
         usable = ensure_supported(path)
@@ -530,6 +553,10 @@ def main():
                     help="图片最长边小于该像素视为装饰图标，默认 %d" % MIN_PX)
     ap.add_argument("--min-area", type=int, default=MIN_AREA,
                     help="图片像素面积小于该值视为低清装饰图，默认 %d" % MIN_AREA)
+    ap.add_argument("--alpha-frac", type=float, default=ALPHA_FRAC,
+                    help="透明像素占比超过该值即视为装饰贴图，全文生效，默认 %.2f"
+                         "（真照片存 PNG 时四角透明边约 2%%，装饰贴纸 55%% 以上，"
+                         "别往下调太低，会误删拼图）" % ALPHA_FRAC)
     ap.add_argument("--workers", type=int, default=8, help="并发数")
     ap.add_argument("--names", default=None,
                     help="可选：文件名简化标题映射表（两列：原文标题或URL / 简化标题，"
@@ -661,7 +688,8 @@ def main():
                 continue
         n_img, skips, n_head, n_end = build_doc(template, spec, a, img_paths, dst,
                                                 args.keep_gif,
-                                                args.min_px, args.min_area)
+                                                args.min_px, args.min_area,
+                                                args.alpha_frac)
         tally = {}
         for reason, url, dims in skips:
             tally[reason] = tally.get(reason, 0) + 1
