@@ -177,6 +177,37 @@ def read_links(path):
 # --------------------------------------------------------------------------
 # 正文解析
 # --------------------------------------------------------------------------
+HEADING_MAX_LEN = 40
+
+
+def heading_level(el, txt):
+    """判断文本块是否为小标题：0=正文，1=主小标题（居中加粗），2=次级小标题（加粗）。
+
+    公众号的小标题基本长这样：短、几乎全文加粗、多居中，句末不带句号。
+    """
+    if len(txt) > HEADING_MAX_LEN:
+        return 0
+    if txt.endswith(("。", "！", "？", "…")):
+        return 0
+    name = (getattr(el, "name", "") or "").lower()
+    if name in ("h1", "h2"):
+        return 1
+    if name in ("h3", "h4", "h5", "h6"):
+        return 2
+    style = (el.get("style") or "").replace(" ", "").lower()
+    p_style = ""
+    if el.parent is not None and hasattr(el.parent, "get"):
+        p_style = (el.parent.get("style") or "").replace(" ", "").lower()
+    bold_chars = sum(len(n.get_text()) for n in el.find_all(["strong", "b"]))
+    ratio = min(1.0, bold_chars / max(1, len(txt)))
+    if "font-weight:bold" in style:
+        ratio = 1.0
+    if ratio < 0.85:
+        return 0
+    centered = "center" in style or "center" in p_style
+    return 1 if centered else 2
+
+
 def parse_article(url, raw_html):
     from bs4 import BeautifulSoup
 
@@ -233,8 +264,10 @@ def parse_article(url, raw_html):
                     walk(child)
                 else:
                     txt = child.get_text().replace("\u200b", "").replace("\xa0", " ").strip()
+                    txt = re.sub(r"[ \t]+", " ", txt)
                     if txt:
-                        blocks.append(("p", re.sub(r"[ \t]+", " ", txt)))
+                        lvl = heading_level(child, txt)
+                        blocks.append(("h%d" % lvl if lvl else "p", txt))
 
         walk(content)
 
@@ -283,6 +316,17 @@ def read_template_spec(template_path):
             continue
         break
 
+    body_size = 11.0
+    try:
+        from docx.oxml.ns import qn
+        dd = doc.styles.element.find(qn("w:docDefaults"))
+        if dd is not None:
+            sz_el = dd.find(".//" + qn("w:sz"))
+            if sz_el is not None:
+                body_size = float(sz_el.get(qn("w:val"))) / 2.0
+    except Exception:
+        pass
+
     img_w = text_w
     for shp in doc.inline_shapes:
         w = int(shp.width)
@@ -291,7 +335,10 @@ def read_template_spec(template_path):
     img_w = min(img_w, text_w)
 
     return {"text_width": text_w, "img_width": img_w,
-            "size_pt": size_pt, "bold": bold}
+            "size_pt": size_pt, "bold": bold,
+            "body_size": body_size,
+            "h1_size": round(body_size + 1, 1),
+            "h2_size": body_size}
 
 
 def clear_body(doc):
@@ -309,6 +356,7 @@ def build_doc(template_path, spec, art, img_paths, out_path,
     from docx.shared import Emu, Pt
     from docx.image.image import Image as DocxImage
     from docx.oxml.ns import qn
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
 
     doc = Document(template_path)
     clear_body(doc)
@@ -328,8 +376,25 @@ def build_doc(template_path, spec, art, img_paths, out_path,
     styled(art["title"])
 
     n_img = 0
+    n_head = 0
     skips = []  # (原因, 图片URL, 尺寸)
     for kind, val in art["blocks"]:
+        if kind in ("h1", "h2"):
+            txt = val.strip()
+            if not txt or txt.upper() == "END":
+                continue
+            p = doc.add_paragraph()
+            r = p.add_run(txt)
+            r.bold = True
+            r.font.size = Pt(spec["h1_size"] if kind == "h1" else spec["h2_size"])
+            r._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:hint"), "eastAsia")
+            if kind == "h1":
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.paragraph_format.space_before = Pt(6)
+                p.paragraph_format.space_after = Pt(6)
+            n_head += 1
+            continue
+
         if kind == "p":
             txt = val.strip()
             if not txt or txt.upper() == "END":
@@ -374,7 +439,7 @@ def build_doc(template_path, spec, art, img_paths, out_path,
                 pass
 
     doc.save(out_path)
-    return n_img, skips
+    return n_img, skips, n_head
 
 
 # --------------------------------------------------------------------------
@@ -391,6 +456,8 @@ def main():
     ap.add_argument("--sort", choices=["auto", "asc", "desc", "none"], default="auto",
                     help="按发布日期排序；auto 表示识别清单里的“排序：”提示")
     ap.add_argument("--keep-gif", action="store_true", help="保留 gif 图片（默认删除装饰性 gif）")
+    ap.add_argument("--no-heading", action="store_true",
+                    help="关闭小标题识别，全部按正文段落输出")
     ap.add_argument("--min-px", type=int, default=MIN_PX,
                     help="图片最长边小于该像素视为装饰图标，默认 %d" % MIN_PX)
     ap.add_argument("--min-area", type=int, default=MIN_AREA,
@@ -449,6 +516,10 @@ def main():
         art["title"] = normalize_title(art["title"], args.column)
         arts.append(art)
 
+    if args.no_heading:
+        for a in arts:
+            a["blocks"] = [("p" if k.startswith("h") else k, v) for k, v in a["blocks"]]
+
     order = args.sort
     if order == "auto":
         order = hint or "none"
@@ -492,23 +563,25 @@ def main():
     for a in arts:
         name = safe_name(a["date"], a["title"])
         dst = os.path.join(args.out, name)
-        n_img, skips = build_doc(template, spec, a, img_paths, dst,
-                                 args.date_note, args.keep_gif,
-                                 args.min_px, args.min_area)
+        n_img, skips, n_head = build_doc(template, spec, a, img_paths, dst,
+                                         args.date_note, args.keep_gif,
+                                         args.min_px, args.min_area)
         tally = {}
         for reason, url, dims in skips:
             tally[reason] = tally.get(reason, 0) + 1
             if reason in ("下载失败", "格式不支持", "无法解析"):
                 lost.append((name, "%s %s" % (dims, url)))
         detail = " ".join("%s%d" % (k, v) for k, v in sorted(tally.items()))
-        rows.append([name, a["date"], a["title"], n_img, len(skips), detail, a["url"]])
-        print("OK  %s  (图 %d%s)" % (name, n_img, ("；跳过 " + detail) if detail else ""))
+        rows.append([name, a["date"], a["title"], n_img, n_head, len(skips), detail, a["url"]])
+        print("OK  %s  (图 %d，小标题 %d%s)" % (
+            name, n_img, n_head, ("；跳过 " + detail) if detail else ""))
 
     # 5) 清单
     manifest = os.path.join(args.out, "_manifest.csv")
     with open(manifest, "w", encoding="utf-8-sig", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["文件名", "日期", "标题", "内嵌图片数", "跳过图片数", "跳过明细", "原文链接"])
+        w.writerow(["文件名", "日期", "标题", "内嵌图片数", "小标题数", "跳过图片数",
+                    "跳过明细", "原文链接"])
         w.writerows(rows)
 
     print("\n完成：%d 篇 → %s" % (len(rows), args.out))
