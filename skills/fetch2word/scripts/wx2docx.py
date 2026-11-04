@@ -33,6 +33,13 @@ from html import unescape
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from title_naming import (NAME_MAX, NAME_TITLE_MAX, load_name_map,  # noqa: E402
+                          lookup_name, safe_name, short_title)
+from filters import (MIN_AREA, MIN_PX, has_transparency,  # noqa: E402
+                     is_decorative, is_end_marker, is_gif, is_qr_code,
+                     is_wide_banner, strip_tail_end)
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 REFERER = "https://mp.weixin.qq.com/"
@@ -44,22 +51,14 @@ DEFAULT_TEMPLATE = os.path.join(SKILL_DIR, "assets", "template.docx")
 # 日期行固定为：yyyy.mm.dd（发出日期）—— 与模板完全一致，不提供开关
 DATE_NOTE = "（发出日期）"
 
-# 文件名规则固定为：文件名：yyyy.mm.dd(Title).docx
-# Title = 标题去掉栏目前缀，剔除 Windows 非法字符，过长截断
-NAME_MAX = 60
+# 文件名规则固定为：yyyy.mm.dd(简化标题).docx
+# 简化标题 = 从标题文字本身提取要点（规则见 title_naming.short_title），
+# 可用 --names 映射表由 AI 覆写；这里不再直接拿原文标题当文件名
 
 # 装饰图判定：最长边不足 MIN_PX，或像素面积不足 MIN_AREA，视为低清装饰图标
-MIN_PX = 200
-MIN_AREA = 40000
+# （阈值定义在 filters.py，与 check_output.py 共用同一套判据）
 # 图片最小可用体积，低于此判定为下载失败的空包
 MIN_BYTES = 500
-
-
-def is_decorative(w, h, min_px=MIN_PX, min_area=MIN_AREA):
-    """低分辨率装饰图（小图标、细分割线、扫尾小图）判定。"""
-    if not w or not h:
-        return True
-    return max(w, h) < min_px or (w * h) < min_area
 
 
 def strip_empty_paragraphs(doc):
@@ -98,15 +97,6 @@ def download_image(url, dst):
     with open(dst, "wb") as fh:
         fh.write(b"")
     return False, 0
-
-
-def is_gif(path):
-    """按文件头判定 gif，避免服务端把 gif 存成 .jpg 时漏判。"""
-    try:
-        with open(path, "rb") as fh:
-            return fh.read(6)[:4] in (b"GIF8",)
-    except Exception:
-        return False
 
 
 def ensure_supported(path):
@@ -321,16 +311,6 @@ def normalize_title(title, column):
     return t
 
 
-def safe_name(date, title):
-    y, m, d = date.split("-")
-    base = title.split("||", 1)[1] if "||" in title else title
-    base = re.sub(r'[\\/:*?"<>|\r\n\t]', "", base)
-    base = re.sub(r"\s+", " ", base).strip()
-    if len(base) > NAME_MAX:
-        base = base[:NAME_MAX]
-    return "%s.%s.%s(%s).docx" % (y, m, d, base)
-
-
 # --------------------------------------------------------------------------
 # 模板解析：版式全部从模板读取
 # --------------------------------------------------------------------------
@@ -419,6 +399,27 @@ def build_doc(template_path, spec, art, img_paths, out_path,
     doc = Document(template_path)
     clear_body(doc)
 
+    # 文末 END（END / -END- / （完）/ THE END）连同其后的装饰图一并清掉
+    orig_blocks = art["blocks"]
+    blocks = strip_tail_end(orig_blocks)
+    n_end = (sum(1 for k, v in orig_blocks if k != "img" and is_end_marker(v))
+             - sum(1 for k, v in blocks if k != "img" and is_end_marker(v)))
+
+    # 开头装饰素材：正文第一段文字之前的贴图（透明底横幅、礼花、华表、分割条）
+    # 只删「透明底 或 超宽横条」，实拍照片照常保留
+    first_text = next((i for i, (k, v) in enumerate(blocks)
+                       if k != "img" and v.strip()), None)
+    lead_decor = set()
+    if first_text:
+        for i, (k, v) in enumerate(blocks[:first_text]):
+            p = img_paths.get(v, "")
+            if k == "img" and p and os.path.exists(p) \
+                    and (has_transparency(p) or is_wide_banner(p)):
+                lead_decor.add(i)
+        # 整篇都是开头贴图（纯图推送）时不能全删，否则产出是空壳
+        if len(lead_decor) >= sum(1 for k, _ in blocks if k == "img"):
+            lead_decor.clear()
+
     def styled(text):
         p = doc.add_paragraph()
         r = p.add_run(text)
@@ -436,10 +437,10 @@ def build_doc(template_path, spec, art, img_paths, out_path,
     n_img = 0
     n_head = 0
     skips = []  # (原因, 图片URL, 尺寸)
-    for kind, val in art["blocks"]:
+    for idx, (kind, val) in enumerate(blocks):
         if kind in ("h1", "h2"):
             txt = val.strip()
-            if not txt or txt.upper() == "END":
+            if not txt or is_end_marker(txt):
                 continue
             p = doc.add_paragraph()
             r = p.add_run(txt)
@@ -455,7 +456,7 @@ def build_doc(template_path, spec, art, img_paths, out_path,
 
         if kind == "p":
             txt = val.strip()
-            if not txt or txt.upper() == "END":
+            if not txt or is_end_marker(txt):
                 continue
             para = doc.add_paragraph()
             para.add_run(txt)
@@ -468,6 +469,14 @@ def build_doc(template_path, spec, art, img_paths, out_path,
             continue
         if (not keep_gif) and is_gif(path):
             skips.append(("gif装饰", val, ""))
+            continue
+        # 二维码：尺寸过得了阈值，只能靠结构判（近正方 + 黑白纯度 + 跳变密集）
+        if is_qr_code(path):
+            skips.append(("二维码", val, ""))
+            continue
+        # 开头贴图素材：正文之前、透明底或超宽横条
+        if idx in lead_decor:
+            skips.append(("开头装饰素材", val, ""))
             continue
 
         usable = ensure_supported(path)
@@ -499,7 +508,7 @@ def build_doc(template_path, spec, art, img_paths, out_path,
                 pass
 
     doc.save(out_path)
-    return n_img, skips, n_head
+    return n_img, skips, n_head, n_end
 
 
 # --------------------------------------------------------------------------
@@ -522,6 +531,14 @@ def main():
     ap.add_argument("--min-area", type=int, default=MIN_AREA,
                     help="图片像素面积小于该值视为低清装饰图，默认 %d" % MIN_AREA)
     ap.add_argument("--workers", type=int, default=8, help="并发数")
+    ap.add_argument("--names", default=None,
+                    help="可选：文件名简化标题映射表（两列：原文标题或URL / 简化标题，"
+                         "Tab 或逗号分隔；优先级高于内置规则）")
+    ap.add_argument("--no-summarize", action="store_true",
+                    help="关闭文件名标题简化，直接用原文标题（默认开启简化）")
+    ap.add_argument("--name-max", type=int, default=NAME_TITLE_MAX,
+                    help="简化后标题的字数上限，默认 %d（--no-summarize 时不生效）"
+                         % NAME_TITLE_MAX)
     ap.add_argument("--cache", default=None, help="中间缓存目录（缺省为系统临时目录）")
     args = ap.parse_args()
 
@@ -561,7 +578,8 @@ def main():
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         pages = dict(ex.map(grab, list(enumerate(urls))))
 
-    # 2) 解析
+    # 2) 解析（标题只做简化，不读正文）
+    name_map = load_name_map(args.names) if args.names else {}
     arts, failed = [], []
     for i, u in enumerate(urls):
         p = pages.get(i)
@@ -573,6 +591,15 @@ def main():
             failed.append((u, "解析不完整（可能被拦截或需要验证）"))
             continue
         art["title"] = normalize_title(art["title"], args.column)
+        # 简化标题：映射表 > 内置规则（都只看标题文字，不额外抓取任何内容）
+        hit = "" if args.no_summarize else lookup_name(name_map, art["url"], art["title"])
+        if hit:
+            art["short"] = hit
+        elif args.no_summarize:
+            # 关掉简化：文件名回到「原文标题（去栏目前缀）」，只剔非法字符
+            art["short"] = art["title"].split("||", 1)[-1].strip()
+        else:
+            art["short"] = short_title(art["title"], args.name_max)
         arts.append(art)
 
     if args.no_heading:
@@ -621,7 +648,8 @@ def main():
     lost = []  # 真正丢内容的图片（下载失败/格式不支持）
     locked = []
     for a in arts:
-        name = safe_name(a["date"], a["title"])
+        name = safe_name(a["date"], a["title"], a["short"],
+                         NAME_MAX if args.no_summarize else args.name_max)
         dst = os.path.join(args.out, name)
         if os.path.exists(dst):
             try:
@@ -631,25 +659,29 @@ def main():
                 locked.append(name)
                 print("SKIP 被占用（请先在 Word/WPS 中关闭）：%s" % name)
                 continue
-        n_img, skips, n_head = build_doc(template, spec, a, img_paths, dst,
-                                         args.keep_gif,
-                                         args.min_px, args.min_area)
+        n_img, skips, n_head, n_end = build_doc(template, spec, a, img_paths, dst,
+                                                args.keep_gif,
+                                                args.min_px, args.min_area)
         tally = {}
         for reason, url, dims in skips:
             tally[reason] = tally.get(reason, 0) + 1
             if reason in ("下载失败", "格式不支持", "无法解析"):
                 lost.append((name, "%s %s" % (dims, url)))
         detail = " ".join("%s%d" % (k, v) for k, v in sorted(tally.items()))
-        rows.append([name, a["date"], a["title"], n_img, n_head, len(skips), detail, a["url"]])
-        print("OK  %s  (图 %d，小标题 %d%s)" % (
-            name, n_img, n_head, ("；跳过 " + detail) if detail else ""))
+        rows.append([name, a["date"], a["title"], a["short"], n_img, n_head,
+                     len(skips), detail, a["url"]])
+        print("OK  %s  (图 %d，小标题 %d%s%s)" % (
+            name, n_img, n_head, ("，删END%d" % n_end) if n_end else "",
+            ("；跳过 " + detail) if detail else ""))
+        if a["short"] != a["title"].split("||", 1)[-1]:
+            print("    标题 → %s" % a["short"])
 
     # 5) 清单
     manifest = os.path.join(args.out, "_manifest.csv")
     with open(manifest, "w", encoding="utf-8-sig", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["文件名", "日期", "标题", "内嵌图片数", "小标题数", "跳过图片数",
-                    "跳过明细", "原文链接"])
+        w.writerow(["文件名", "日期", "标题", "简化标题", "内嵌图片数", "小标题数",
+                    "跳过图片数", "跳过明细", "原文链接"])
         w.writerows(rows)
 
     print("\n完成：%d 篇 → %s" % (len(rows), args.out))
