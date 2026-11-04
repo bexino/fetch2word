@@ -180,6 +180,40 @@ def read_links(path):
 # --------------------------------------------------------------------------
 # 正文解析
 # --------------------------------------------------------------------------
+# 纯序号块：05 / 5 / 一、 / （二）
+ORDINAL_RE = re.compile(r"^(?:\d{1,2}|[一二三四五六七八九十]{1,3})[、.）)]?$")
+# 附件/附表编号也算序号块
+ATTACH_RE = re.compile(r"^(?:附件|附表|附录)\s*\d{1,2}$")
+
+
+def merge_ordinal_blocks(blocks):
+    """把「05」+「我是一段描述文本」合成一整行小标题「05 我是一段描述文本」。
+
+    公众号常用「大号数字编号 + 标题文字」两段式，落到 Word 里会被拆成两行，
+    读起来像断头。这里按“序号紧跟短标题”识别并合并，合并结果沿用标题样式。
+    """
+    out = []
+    i = 0
+    n = len(blocks)
+    while i < n:
+        kind, val = blocks[i]
+        cur = val.strip()
+        is_ordinal = bool(ORDINAL_RE.match(cur) or ATTACH_RE.match(cur))
+        if is_ordinal and i + 1 < n:
+            nk, nv = blocks[i + 1]
+            nxt = nv.strip()
+            nxt_is_heading = nk.startswith("h")
+            nxt_is_short = (not nxt.endswith(("。", "！", "？", "；"))) and len(nxt) <= 30
+            if (nxt_is_heading or nxt_is_short) and not (ORDINAL_RE.match(nxt) or ATTACH_RE.match(nxt)):
+                level = nk if nxt_is_heading else "h1"
+                out.append((level, "%s %s" % (cur, nxt)))
+                i += 2
+                continue
+        out.append((kind, val))
+        i += 1
+    return out
+
+
 HEADING_MAX_LEN = 40
 
 
@@ -273,6 +307,7 @@ def parse_article(url, raw_html):
                         blocks.append(("h%d" % lvl if lvl else "p", txt))
 
         walk(content)
+        blocks = merge_ordinal_blocks(blocks)
 
     return {"url": url, "title": title, "date": date, "blocks": blocks}
 
@@ -353,6 +388,26 @@ def clear_body(doc):
         body.remove(child)
 
 
+INDENT_CHARS = 2  # 正文首行缩进 2 字符
+
+
+def apply_first_line_indent(para, body_size):
+    """给正文段落加首行缩进 2 字符。
+
+    同时写 firstLineChars（Word 认的“字符”单位）和 firstLine（twips 兜底），
+    保证 Word / WPS / LibreOffice 都缩进一致。
+    """
+    from docx.oxml.ns import qn
+
+    ppr = para._p.get_or_add_pPr()
+    ind = ppr.find(qn("w:ind"))
+    if ind is None:
+        ind = ppr.makeelement(qn("w:ind"), {})
+        ppr.append(ind)
+    ind.set(qn("w:firstLineChars"), str(INDENT_CHARS * 100))
+    ind.set(qn("w:firstLine"), str(int(body_size * INDENT_CHARS * 20)))
+
+
 def build_doc(template_path, spec, art, img_paths, out_path,
               keep_gif, min_px=MIN_PX, min_area=MIN_AREA):
     from docx import Document
@@ -402,7 +457,9 @@ def build_doc(template_path, spec, art, img_paths, out_path,
             txt = val.strip()
             if not txt or txt.upper() == "END":
                 continue
-            doc.add_paragraph().add_run(txt)
+            para = doc.add_paragraph()
+            para.add_run(txt)
+            apply_first_line_indent(para, spec["body_size"])
             continue
 
         path = img_paths.get(val, "")

@@ -15,7 +15,8 @@
     6. 首段严格为 yyyy.mm.dd（发出日期）
     7. 次段非空                  —— 标题行存在
     8. 第 3 段起无居中段落        —— 小标题必须居左
-    9. 体积 < 8MB（默认软阈值）  —— 提示残留部件
+    9. 正文段落均有首行缩进      —— 小标题除外
+   10. 体积 < 8MB（默认软阈值）  —— 提示残留部件
 """
 
 import argparse
@@ -41,6 +42,7 @@ def is_decorative(w, h, min_px, min_area):
 def check_one(path, min_px, min_area):
     from docx import Document
     from docx.image.image import Image as DocxImage
+    from docx.oxml.ns import qn
 
     doc = Document(path)
     body_xml = doc.element.body.xml
@@ -99,6 +101,24 @@ def check_one(path, min_px, min_area):
     centered = [p.text[:12] for p in paras[2:] if str(p.alignment).startswith("CENTER")]
     if centered:
         problems.append("存在居中段落:%s" % centered[:2])
+
+    # 正文必须有首行缩进（小标题不加缩进）
+    no_indent = 0
+    for p in paras[2:]:
+        if not p.text.strip():
+            continue
+        first = p.runs[0] if p.runs else None
+        if first is not None and first.bold:
+            continue
+        ppr = p._p.pPr
+        ind = ppr.find(qn("w:ind")) if ppr is not None else None
+        ok = False
+        if ind is not None:
+            ok = bool(ind.get(qn("w:firstLineChars")) or ind.get(qn("w:firstLine")))
+        if not ok:
+            no_indent += 1
+    if no_indent:
+        problems.append("缺首行缩进:%d段" % no_indent)
     if not title:
         problems.append("缺标题行")
     if size_kb > SIZE_LIMIT_KB:
